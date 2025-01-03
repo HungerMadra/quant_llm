@@ -1,0 +1,16 @@
+# Ignore API keys and environment variables
+keys.env
+
+# Ignore compiled Python files
+__pycache__/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore logs and temporary files
+*.log
+*.tmp
+
+# Ignore dataset files (optional)
+*.csv
+*.xlsx
