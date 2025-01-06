@@ -13,112 +13,167 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 if not POLYGON_API_KEY:
     raise ValueError("Missing POLYGON_API_KEY! Make sure it's in keys.env")
 
-# === 1️⃣ Get S&P 500 and Nasdaq-100 Historical Constituents from Wikipedia ===
-def get_sp500_historical():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    sp500_df = tables[0]  # First table contains the current S&P 500
-    return sp500_df[['Symbol', 'Security', 'GICS Sector']]
 
-def get_nasdaq_100_historical():
-    url = "https://en.wikipedia.org/wiki/NASDAQ-100"
-    tables = pd.read_html(url)
-    nasdaq_df = tables[4]  # Historical component changes table
-    return nasdaq_df[['Ticker', 'Added', 'Removed']]
+# === 1️⃣ Scrape NYSE Listings from NYSE Website ===
+def scrape_nyse():
+    """Scrapes all pages of NYSE listings from the official NYSE directory."""
+    base_url = "https://www.nyse.com/api/quotes/filter"
+    nyse_tickers = set()
 
-# === 2️⃣ Get All Traded Stocks from Polygon.io ===
-def get_polygon_tickers():
-    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&apiKey={POLYGON_API_KEY}"
-    response = requests.get(url)
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    payload = {
+        "instrumentType": "EQUITY",
+        "pageNumber": 1,
+        "sortColumn": "NORMALIZED_TICKER",
+        "sortOrder": "ASC",
+        "maxResultsPerPage": 100
+    }
+
+    response = requests.post(base_url, json=payload, headers=headers)
     data = response.json()
-    
-    tickers = [stock['ticker'] for stock in data.get('results', [])]
+
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        total_tickers = data[0].get("total", 0)
+    else:
+        print("❌ Unexpected NYSE API response format!")
+        print(data)
+        return []
+
+    max_results_per_page = 100
+    total_pages = (total_tickers // max_results_per_page) + (1 if total_tickers % max_results_per_page else 0)
+
+    print(f"📊 NYSE has {total_tickers} tickers across {total_pages} pages.")
+
+    for page in range(1, total_pages + 1):
+        print(f"📥 Scraping NYSE directory page {page}/{total_pages}")
+
+        payload["pageNumber"] = page
+        response = requests.post(base_url, json=payload, headers=headers)
+        data = response.json()
+
+        tickers_found = set()
+        for entry in data:
+            if isinstance(entry, dict) and "symbolTicker" in entry:
+                tickers_found.add(entry["symbolTicker"])
+
+        print(f"✅ Found {len(tickers_found)} tickers on page {page}")
+        nyse_tickers.update(tickers_found)
+
+    print(f"✅ Finished! Total NYSE tickers collected: {len(nyse_tickers)}")
+    return list(nyse_tickers)
+
+
+# === 2️⃣ Scrape Wikipedia for NYSE & NASDAQ Listings ===
+def scrape_wikipedia():
+    """Scrapes Wikipedia pages for NYSE and NASDAQ listings."""
+    base_url = "https://en.wikipedia.org/wiki/Companies_listed_on_the_New_York_Stock_Exchange_({})"
+    pages = ['0%E2%80%939'] + [chr(i) for i in range(ord('A'), ord('Z') + 1)]
+    wikipedia_tickers = set()
+
+    for page in pages:
+        url = base_url.format(page)
+        print(f"📥 Scraping Wikipedia NYSE page: {url}")
+
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch page: {url}")
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        tickers_found = set()
+
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "nyse.com/quote/XNYS:" in href or "nasdaq.com/market-activity/stocks/" in href:
+                symbol = href.split(":")[-1]
+                tickers_found.add(symbol)
+
+        print(f"✅ Found {len(tickers_found)} tickers on {page} page.")
+        wikipedia_tickers.update(tickers_found)
+
+    print(f"✅ Finished! Total Wikipedia tickers collected: {len(wikipedia_tickers)}")
+    return list(wikipedia_tickers)
+
+def get_polygon_tickers():
+    """Fetches all currently traded stock tickers from Polygon.io, handling pagination and rate limits."""
+    tickers = []
+    base_url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&apiKey={POLYGON_API_KEY}&limit=1000"
+    total_tickers = 0  # Track total tickers retrieved
+
+    print("📊 Fetching tickers from Polygon.io...")
+
+    while base_url:
+        print(f"📥 Requesting: {base_url}")
+        response = requests.get(base_url)
+        data = response.json()
+
+        if "results" in data:
+            batch_tickers = [stock['ticker'] for stock in data['results']]
+            tickers.extend(batch_tickers)
+            total_tickers += len(batch_tickers)
+            print(f"✅ Retrieved {len(batch_tickers)} tickers. Total so far: {total_tickers}")
+        else:
+            # Handle rate limit error and retry after waiting
+            if "error" in data and "exceeded the maximum requests per minute" in data["error"]:
+                print("⏳ Rate limit exceeded. Waiting 60 seconds before retrying...")
+                time.sleep(60)  # Wait for 1 minute before retrying
+                continue  # Retry the last request
+
+            print(f"❌ Unexpected response from Polygon: {data}")
+            break  # Stop fetching if response format is incorrect
+
+        # Check for the next cursor and append API key manually
+        next_cursor = data.get("next_url")
+        if next_cursor:
+            base_url = f"{next_cursor}&apiKey={POLYGON_API_KEY}"
+        else:
+            break  # No more pages
+
+        time.sleep(1)  # Prevent hitting API rate limits too quickly
+
+    print(f"✅ Finished! Total Polygon tickers collected: {total_tickers}")
     return pd.DataFrame(tickers, columns=['Symbol'])
 
-# === 3️⃣ Get Delisted Stocks from SEC EDGAR ===
-def get_sec_delisted_stocks():
-    url = "https://www.sec.gov/rules/delist.shtml"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
+# === 4️⃣ Save Data to CSV ===
+def save_to_csv(data, filename="all_traded_stocks_2014_2019.csv"):
+    """Saves the collected tickers to a CSV file."""
+    if os.path.exists(filename):
+        data.to_csv(filename, mode='a', header=False, index=False)
+    else:
+        data.to_csv(filename, mode='w', index=False)
+    print(f"✅ Data saved to {filename}")
 
-    delisted_stocks = []
-    for link in soup.find_all('a'):
-        if 'pdf' in link.get('href', ''):
-            delisted_stocks.append(link.get_text())
 
-    return pd.DataFrame(delisted_stocks, columns=['Company Name'])
-
-# === 4️⃣ Get IPOs from NASDAQ ===
-def get_nasdaq_ipos():
-    url = "https://www.nasdaq.com/market-activity/ipos"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    ipos = []
-    for row in soup.find_all('tr'):
-        cols = row.find_all('td')
-        if len(cols) > 1:
-            ipo_data = [col.text.strip() for col in cols]
-            ipos.append(ipo_data)
-
-    return pd.DataFrame(ipos, columns=['Company Name', 'IPO Date', 'Exchange'])
-
-# === 5️⃣ Filter by IPO and Delisting Dates ===
-def filter_by_dates(ipos, delisted):
-    ipos['IPO Date'] = pd.to_datetime(ipos['IPO Date'], errors='coerce')
-    ipos = ipos[(ipos['IPO Date'] >= "2014-01-01") & (ipos['IPO Date'] <= "2019-12-31")]
-
-    delisted['Delisted Date'] = pd.to_datetime(delisted['Delisted Date'], errors='coerce')
-    delisted = delisted[(delisted['Delisted Date'] >= "2014-01-01") & (delisted['Delisted Date'] <= "2019-12-31")]
-
-    return ipos, delisted
-
-# === 6️⃣ Verify Trading Activity via Yahoo Finance ===
-def check_stock_activity(ticker):
-    try:
-        stock = yf.download(ticker, start="2014-01-01", end="2019-12-31", interval="1d")
-        return not stock.empty
-    except:
-        return False
-
-# === 7️⃣ Merge and Save Data ===
+# === 5️⃣ Master Function to Run Everything ===
 def compile_stock_list():
-    print("Fetching S&P 500 and Nasdaq historical data...")
-    sp500 = get_sp500_historical()
-    nasdaq = get_nasdaq_100_historical()
+    print("📊 Fetching NYSE, S&P 500, Nasdaq, and traded stock data...")
 
-    print("Fetching all traded stocks from Polygon.io...")
-    all_tickers = get_polygon_tickers()
+    # ✅ Scrape NYSE Website
+    nyse_tickers = scrape_nyse()
+    nyse_df = pd.DataFrame(nyse_tickers, columns=["Symbol"])
+    nyse_df["Source"] = "NYSE"
 
-    print("Fetching delisted stocks from SEC EDGAR...")
-    delisted = get_sec_delisted_stocks()
+    # ✅ Scrape Wikipedia
+    wikipedia_tickers = scrape_wikipedia()
+    wikipedia_df = pd.DataFrame(wikipedia_tickers, columns=["Symbol"])
+    wikipedia_df["Source"] = "Wikipedia"
 
-    print("Fetching IPOs from NASDAQ...")
-    ipos = get_nasdaq_ipos()
+    # ✅ Fetch Polygon Data (with Logging)
+    polygon_tickers = get_polygon_tickers()
+    polygon_tickers["Source"] = "Polygon"
 
-    print("Filtering by IPO and delisting dates...")
-    ipos, delisted = filter_by_dates(ipos, delisted)
+    # ✅ Combine all sources
+    all_data = pd.concat([nyse_df, wikipedia_df, polygon_tickers], ignore_index=True)
+    print(f"✅ Total tickers collected: {len(all_data)}")
 
-    print("Verifying trading activity...")
-    verified_tickers = []
-    for ticker in all_tickers['Symbol']:
-        if check_stock_activity(ticker):
-            verified_tickers.append(ticker)
-        time.sleep(1)  # Avoid API rate limits
+    # ✅ Save data
+    save_to_csv(all_data)
 
-    print("Merging all data sources...")
-    combined = pd.concat([sp500, nasdaq, pd.DataFrame(verified_tickers, columns=['Symbol']), delisted, ipos], ignore_index=True)
 
-    print(f"Total unique stocks collected: {combined.shape[0]}")
-    
-    # Save to CSV
-    combined.to_csv("all_traded_stocks_2014_2019.csv", index=False)
-    print("Data saved as all_traded_stocks_2014_2019.csv")
-
-# === Run the automation ===
+# === Run the script ===
 if __name__ == "__main__":
     compile_stock_list()
